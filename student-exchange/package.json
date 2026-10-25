@@ -1,0 +1,15 @@
+{
+  "name": "student-exchange-prototypes",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Student Exchange mobile web prototype and separate Expo starter",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "scripts": {
+    "web": "node scripts/serve-web.mjs",
+    "test": "node --test web/model.test.mjs mobile/tests/auth.test.cjs",
+    "check": "node scripts/check.mjs",
+    "build:preview": "node mobile/scripts/build-preview.cjs"
+  }
+}
