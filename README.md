@@ -1,4 +1,4 @@
-# [Enter Project Name Here]
+# Student Exchange
 
 > Intro to Software Engineering group project template
 
@@ -8,9 +8,9 @@ Replace every bracketed placeholder in this repository with information about yo
 
 | Field | Enter your information |
 | --- | --- |
-| Course | [Enter course number and section] |
-| Instructor | [Enter instructor name] |
-| Semester | [Enter semester and year] |
+| Course | CSCI 3508 001 |
+| Instructor | Dr. Salah Boukhris |
+| Semester | Fall 2026 |
 | Project subject | [Enter the proposed subject] |
 | Approval status | [Pending / Approved on YYYY-MM-DD] |
 | Repository URL | [Enter repository URL] |
