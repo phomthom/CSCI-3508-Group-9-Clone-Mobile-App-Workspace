@@ -1,7 +1,7 @@
 plugins { id 'com.android.application' }
 
 // Public adapter origin only. Application credentials are never build inputs.
-def adapterUrl = providers.environmentVariable('SE_ADAPTER_URL').getOrElse('')
+def adapterUrl = providers.environmentVariable('SE_ADAPTER_URL').getOrElse('https://studentexchangemobile.onrender.com/')
 if (adapterUrl) {
  def endpoint
  try { endpoint = new URI(adapterUrl) } catch (Exception ignored) { throw new GradleException('SE_ADAPTER_URL must be a valid public HTTPS adapter origin.') }
