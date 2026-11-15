@@ -2,12 +2,14 @@ import { once } from 'node:events'
 import { createWebsiteServer } from './app.mjs'
 import { createMockBackend } from './mock-backend.mjs'
 
-const mock = createMockBackend()
+// This launcher remains mock-only even when a local environment credential is supplied.
+const appAccess = process.env.SE_APP_ACCESS?.trim() || 'mock-app-only'
+const mock = createMockBackend({ appAccess })
 mock.listen(0, '127.0.0.1')
 await once(mock, 'listening')
 const adapter = createWebsiteServer({
   backend: `http://127.0.0.1:${mock.address().port}/`,
-  appAccess: 'mock-app-only', user: 'service@mock.invalid', userPass: 'mock-password-only',
+  appAccess,
   production: false,
 })
 adapter.listen(3100, '127.0.0.1')

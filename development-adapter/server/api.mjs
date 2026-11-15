@@ -1,8 +1,10 @@
+import { MOCK_POLICY, validateBackend, destinationFor } from './backend-policy.mjs'
+import { imageResponse } from './images.mjs'
+import { listingFields, messageFields, messageResponse } from './mobile-contracts.mjs'
 import { marketplaceRoute, marketplaceResponse } from './marketplace.mjs'
 import { randomBytes } from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
-import { clientIp } from './client-ip.mjs'
 import {
   adminStatus,
   adminUsers,
@@ -22,28 +24,14 @@ const SESSION_COOKIE = 'se_session'
 const SESSION_LIFETIME = 12 * 60 * 60 * 1000
 const MAX_BODY = 16 * 1024
 const MAX_RESPONSE = 1024 * 1024
-const PROFILE_FIELDS = ['email', 'first_name', 'last_name', 'school']
+const PROFILE_FIELDS = ['email', 'first_name', 'last_name', 'school', 'user', 'location']
 const EDITABLE_FIELDS = [...PROFILE_FIELDS, 'password']
+// Register POST generates the username and rejects user/location; PATCH permits both.
+const REGISTRATION_FIELDS = ['email', 'first_name', 'last_name', 'school', 'password']
 
-// Respect managed HTTPS proxies without routing local development fixtures through them.
-// Node 24 supports proxyEnv on its native agents, including requests with GET bodies.
-const proxyEnv = {
-  HTTP_PROXY: process.env.HTTP_PROXY,
-  HTTPS_PROXY: process.env.HTTPS_PROXY,
-  http_proxy: process.env.http_proxy,
-  https_proxy: process.env.https_proxy,
-  NO_PROXY: [
-    process.env.NO_PROXY,
-    process.env.no_proxy,
-    'localhost',
-    '127.0.0.1',
-    '::1',
-  ]
-    .filter(Boolean)
-    .join(','),
-}
-const httpAgent = new http.Agent({ proxyEnv })
-const httpsAgent = new https.Agent({ proxyEnv })
+// Explicit agents keep credentials out of environment-configured HTTP proxies.
+const httpAgent = new http.Agent({ keepAlive:false })
+const httpsAgent = new https.Agent({ keepAlive:false })
 
 class ApiError extends Error {
   constructor(status, message) {
@@ -62,15 +50,15 @@ function send(response, status, body) {
   response.end(JSON.stringify(body))
 }
 
-async function readBody(request) {
-  if (!request.headers['content-type']?.startsWith('application/json')) {
+async function readBody(request, limit = MAX_BODY) {
+  if (request.headers['content-type']?.split(';')[0].trim().toLowerCase() !== 'application/json') {
     throw new ApiError(415, 'Send this request as JSON.')
   }
   const chunks = []
   let size = 0
   for await (const chunk of request) {
     size += chunk.length
-    if (size > MAX_BODY) throw new ApiError(413, 'The request is too large.')
+    if (size > limit) throw new ApiError(413, 'The request is too large.')
     chunks.push(chunk)
   }
   try {
@@ -83,7 +71,7 @@ async function readBody(request) {
   }
 }
 
-/** Allow only public form fields; clients cannot replace app credentials or forwarded IPs. */
+/** Allow only public form fields; clients cannot replace server credentials. */
 function formFields(body, allowed, required = allowed) {
   if (Object.keys(body).some((key) => !allowed.includes(key))) {
     throw new ApiError(400, 'The request contains an unsupported field.')
@@ -107,7 +95,7 @@ function formFields(body, allowed, required = allowed) {
 function publicProfile(value) {
   if (
     !value ||
-    PROFILE_FIELDS.some((field) => typeof value[field] !== 'string')
+    PROFILE_FIELDS.some((field) => field === 'location' ? value[field] !== null && typeof value[field] !== 'string' : typeof value[field] !== 'string')
   ) {
     throw new ApiError(
       502,
@@ -121,11 +109,10 @@ function publicProfile(value) {
 }
 
 /** Node's HTTP client supports the API's GET body; browser fetch and Node fetch do not. */
-export function upstream(base, route, method, body, timeoutMs = UPSTREAM_TIMEOUT_MS) {
-  const destination = new URL(route, base)
-  // Development isolation: never permit upstream traffic outside IPv4 loopback.
-  if (destination.hostname !== '127.0.0.1' || destination.protocol !== 'http:')
-    throw new ApiError(503, 'Development adapter permits only the local mock backend.')
+export function upstream(base, route, method, body, timeoutMs = UPSTREAM_TIMEOUT_MS, trafficPolicy = MOCK_POLICY) {
+  if (body && ['ip', 'admin_token'].some(key => Object.hasOwn(body, key)))
+    throw new ApiError(400, 'Forwarding fields are forbidden.')
+  const destination = destinationFor(base, route, trafficPolicy)
   const data = body ? JSON.stringify(body) : undefined
   const signal = AbortSignal.timeout(timeoutMs)
   return new Promise((resolve, reject) => {
@@ -222,10 +209,7 @@ export function upstream(base, route, method, body, timeoutMs = UPSTREAM_TIMEOUT
                 safeMessage,
               )
             const error = new ApiError(expired ? 401 : status, safeMessage)
-            error.forwardingExpired =
-              status === 400 &&
-              (value?.expired === true || value?.Expired === true)
-            error.sessionExpired = Boolean(expired) && !error.forwardingExpired
+            error.sessionExpired = Boolean(expired)
             reject(error)
           } else resolve(value)
         })
@@ -237,116 +221,20 @@ export function upstream(base, route, method, body, timeoutMs = UPSTREAM_TIMEOUT
 }
 
 /** Validate the fixed destination before sending server credentials. */
-export function backendUrl(backend) {
-  let base
-  if (backend) {
-    try {
-      base = new URL(backend.endsWith('/') ? backend : `${backend}/`)
-      const local = ['localhost', '127.0.0.1', '[::1]'].includes(base.hostname)
-      if (
-        !['http:', 'https:'].includes(base.protocol) ||
-        (base.protocol === 'http:' && !local) ||
-        base.username ||
-        base.password ||
-        base.search ||
-        base.hash
-      ) {
-        throw new Error()
-      }
-    } catch {
-      throw new Error(
-        'backend must be an HTTPS service URL, or an HTTP loopback URL for local development, without credentials, query, or fragment.',
-      )
-    }
-  }
-
-  if (base && (base.hostname !== '127.0.0.1' || base.protocol !== 'http:'))
-    throw new Error('Development adapter requires an HTTP 127.0.0.1 mock backend.')
-  return base
+export function backendUrl(backend, trafficPolicy = MOCK_POLICY) {
+  return validateBackend(backend, trafficPolicy)
 }
 
-/** One service token per adapter, shared by all visitors and kept only in server memory. */
-export function createForwardingClient({
-  backend,
-  appAccess,
-  user,
-  userPass,
-  timeoutMs = UPSTREAM_TIMEOUT_MS,
-}) {
-  const base = backendUrl(backend)
-  const configured = Boolean(base && appAccess?.trim() && user?.trim() && userPass?.trim())
-  let token
-  let loginPending
-  const unavailable = () => new ApiError(503, 'Accounts are temporarily unavailable. Please try again later.')
-
-  function login(rejectedToken) {
-    // Another request may already have replaced the rejected token.
-    if (token && token !== rejectedToken) return Promise.resolve(token)
-    if (loginPending) return loginPending
-    loginPending = (async () => {
-      try {
-        // Bootstrap uses the connection IP: forwarding requires a token we don't have yet.
-        const result = await upstream(
-          base, 'LogIn', 'POST',
-          { app_access: appAccess, email: user, password: userPass },
-          timeoutMs,
-        )
-        if (
-          typeof result?.access_token !== 'string' ||
-          !result.access_token.trim()
-        ) throw unavailable()
-        const membership = await upstream(
-          base, 'Admin', 'GET',
-          { app_access: appAccess, access_token: result.access_token },
-          timeoutMs,
-        )
-        if (membership?.is_admin !== true) throw unavailable()
-        token = result.access_token
-        return token
-      } catch {
-        // Service-account errors must never reveal its credentials or clear a visitor session.
-        throw unavailable()
-      } finally {
-        loginPending = undefined
-      }
-    })()
-    return loginPending
-  }
-
-  // Start login at website initialization; handle failures so static pages remain available.
-  if (configured) void login().catch(() => {})
+/** Application authentication stays on the adapter. Never forward client IPs or admin tokens. */
+export function createApplicationClient({ backend, appAccess, timeoutMs = UPSTREAM_TIMEOUT_MS, trafficPolicy = MOCK_POLICY }) {
+  const base = backendUrl(backend, trafficPolicy)
   return {
-    async call(route, method, fields, ip) {
-      if (!configured) {
-        if (route !== 'Schools') throw unavailable()
-        return upstream(
-          base, route, method,
-          { ...fields, ...(appAccess ? { app_access: appAccess } : {}), ip },
-          timeoutMs,
-        )
-      }
-      const current = await login()
-      const send = (adminToken) => upstream(
-        base, route, method,
-        { ...fields, app_access: appAccess, ip, admin_token: adminToken },
-        timeoutMs,
-      )
-      try {
-        return await send(current)
-      } catch (error) {
-        if (!error.forwardingExpired) throw error
-        // AppAuthJson rejects forwarding expiry before any operation is performed.
-        const fresh = await login(current)
-        try {
-          return await send(fresh)
-        } catch (retryError) {
-          if (retryError.forwardingExpired) {
-            if (token === fresh) token = undefined
-            throw unavailable()
-          }
-          throw retryError
-        }
-      }
+    async call(route, method, fields = {}, remainingMs = timeoutMs) {
+      if (!base || !appAccess?.trim())
+        throw new ApiError(503, 'Accounts are temporarily unavailable. Please try again later.')
+      if (['ip', 'admin_token', 'app_access'].some(key => Object.hasOwn(fields, key)))
+        throw new ApiError(400, 'The request contains an unsupported authentication field.')
+      return upstream(base, route, method, { ...fields, app_access: appAccess }, Math.min(timeoutMs, remainingMs), trafficPolicy)
     },
   }
 }
@@ -359,17 +247,15 @@ export function createForwardingClient({
 export function createApiHandler({
   backend,
   appAccess,
-  user,
-  userPass,
-  renderProxy = false,
   production = false,
+  publicOrigin,
+  apiOnly = false,
+  trafficPolicy = MOCK_POLICY,
   timeoutMs = UPSTREAM_TIMEOUT_MS,
 } = {}) {
   const sessions = new Map()
-  const base = backendUrl(backend)
-  const service = createForwardingClient({
-    backend, appAccess, user, userPass, timeoutMs,
-  })
+  const base = backendUrl(backend, trafficPolicy)
+  const service = createApplicationClient({ backend, appAccess, timeoutMs, trafficPolicy })
 
   function setCookie(response, id = '', lifetime = 0) {
     response.setHeader(
@@ -391,9 +277,15 @@ export function createApiHandler({
   }
 
   return async (request, response) => {
+    const deadline = Date.now() + timeoutMs
     const path = new URL(request.url, 'http://website.local').pathname
+    if (apiOnly && path.startsWith('/api/admin')) { send(response,404,{message:'API route not found.'}); return }
     const method = request.method
-    const market = marketplaceRoute(new URL(request.url, 'http://website.local'))
+    const url = new URL(request.url, 'http://website.local')
+    const image = /^\/api\/images\/([A-Za-z0-9_-]+\.(?:png|jpg|jpeg|webp))$/.exec(path)
+    const mine = path === '/api/my-listings'
+    const messaging = /^\/api\/messages(?:\/(unread|[1-9][0-9]*))?$/.exec(path)
+    const market = mine ? {route:'Listing', kind:'listings', fields:()=>({for_user:''})} : marketplaceRoute(url)
     const routes = {
       '/api/schools': ['GET'],
       '/api/register': ['POST'],
@@ -407,12 +299,9 @@ export function createApiHandler({
       '/api/admin/blocked': ['GET', 'DELETE'],
       '/api/admin/schools': ['GET', 'POST', 'DELETE'],
     }
-    if (market) routes[path] = ['GET']
-    if (market && method !== 'GET') {
-      response.setHeader('Allow', 'GET')
-      send(response, 405, { message: 'Marketplace is read-only.' })
-      return
-    }
+    if (market) routes[path] = mine || market.kind === 'names' ? ['GET'] : market.kind === 'detail' ? ['GET','PATCH','DELETE'] : ['GET','POST']
+    if (image) routes[path] = ['GET']
+    if (messaging) routes[path] = messaging[1] ? ['GET'] : ['GET','POST']
     if (!routes[path]) {
       send(response, 404, { message: 'API route not found.' })
       return
@@ -422,15 +311,17 @@ export function createApiHandler({
       send(response, 405, { message: 'Method not allowed.' })
       return
     }
+    for (const [id, value] of sessions) if (value.expires <= Date.now()) sessions.delete(id)
     const session = sessionFor(request)
     try {
-      if (method !== 'GET') {
+      if (method !== 'GET' || production && publicOrigin) {
+        // The deployed API also protects GETs that mark messages/activity as read.
         // Origin is supplied by browser fetch. Host cannot be chosen by a cross-site script.
-        const expectedOrigin = `${production ? 'https' : 'http'}://${request.headers.host}`
+        const expectedOrigin = publicOrigin || `${production ? 'https' : 'http'}://${request.headers.host}`
         if (request.headers.origin !== expectedOrigin)
           throw new ApiError(
             403,
-            'Please submit account changes from this website.',
+            'Use the configured application origin for API requests.',
           )
       }
       if (path === '/api/logout' && !session) {
@@ -439,7 +330,7 @@ export function createApiHandler({
         return
       }
       if (
-        (path === '/api/profile' ||
+        (mine || messaging || (market && method !== 'GET') || path === '/api/profile' ||
           path === '/api/logout' ||
           path.startsWith('/api/admin')) &&
         !session
@@ -449,28 +340,53 @@ export function createApiHandler({
       }
       if (
         !base ||
-        (path !== '/api/schools' && (!appAccess?.trim() || !user?.trim() || !userPass?.trim()))
+        !appAccess?.trim()
       ) {
         throw new ApiError(
           503,
           'Accounts are temporarily unavailable. Please try again later.',
         )
       }
-      // The adapter owns the security envelope for EVERY backend request,
-      // including the public Schools lookup and authenticated GET bodies.
-      let ip
-      try {
-        ip = clientIp(request, { renderProxy })
-      } catch {
-        throw new ApiError(400, 'Unable to verify your network address. Please try again.')
+      // GET bodies are sent by Node; Android never receives application credentials.
+      const call = (route, verb, fields) => {
+        const remainingMs = deadline - Date.now()
+        if (remainingMs <= 0) throw new ApiError(504, 'The backend request deadline was exceeded.')
+        return service.call(route, verb, fields, remainingMs)
       }
-      const call = (route, verb, fields) => service.call(route, verb, fields, ip)
       const credentials = session ? { access_token: session.token } : {}
 
-      if (market) {
-        const fields = market.fields()
-        const data = await call(market.route, 'GET', fields)
-        send(response, 200, marketplaceResponse(market.kind, data))
+      if (image) {
+        if (url.search) throw new ApiError(400, 'Invalid image query.')
+        await imageResponse(base, image[1], response, trafficPolicy, timeoutMs)
+      } else if (market) {
+        if (mine && url.search) throw new ApiError(400, 'Unsupported listing filter.')
+        if (method === 'GET') {
+          const fields = market.fields()
+          const data = await call(market.route, 'GET', { ...fields, ...(mine || market.kind === 'detail' ? credentials : {}) })
+          send(response, 200, marketplaceResponse(market.kind, data))
+        } else {
+          if (url.search) throw new ApiError(400, 'Unsupported listing filter.')
+          const fields = method === 'DELETE' ? {id:Number(path.split('/').pop())} : listingFields(await readBody(request, 23*1024*1024), method === 'PATCH')
+          let result
+          try {
+            result = await call(method === 'DELETE' ? 'Listing' : market.route, method, {...fields,...credentials})
+          } catch (error) {
+            // Listing ownership/status denials use 401 without invalidating the user's token.
+            if (error.status === 401 && !error.sessionExpired)
+              throw new ApiError(403, 'You do not have permission to change this listing.')
+            throw error
+          }
+          // Creation returns a message, never an ID. Refresh own listings after success.
+          if (!(typeof result === 'string' || typeof result?.message === 'string')) throw new ApiError(502, 'Invalid listing action response.')
+          send(response, method === 'POST' ? 201 : 200, {message: method === 'POST' ? 'Listing created.' : method === 'DELETE' ? 'Listing deleted.' : 'Listing updated.'})
+        }
+      } else if (messaging) {
+        const suffix = messaging[1]
+        if (url.search && (!suffix || suffix === 'unread' || [...url.searchParams.keys()].some(k=>k!=='after') || url.searchParams.getAll('after').length !== 1 || !/^(0|[1-9][0-9]*)$/.test(url.searchParams.get('after')) || !Number.isSafeInteger(Number(url.searchParams.get('after'))))) throw new ApiError(400, 'Invalid message cursor.')
+        const fields = method === 'POST' ? messageFields(await readBody(request)) : {}
+        const route = 'api/Message' + (suffix ? '/' + suffix : '') + (url.search || '')
+        const data = await call(route, method, {...fields,...credentials})
+        send(response, method === 'POST' ? 201 : 200, messageResponse(data, method === 'POST' ? 'sent' : !suffix ? 'conversations' : suffix === 'unread' ? 'unread' : 'messages'))
       } else if (path.startsWith('/api/admin')) {
         // Read membership afresh for every operation so a demotion takes effect immediately.
         const status = adminStatus(await call('Admin', 'GET', credentials))
@@ -639,7 +555,7 @@ export function createApiHandler({
         }
         send(response, 200, { schools: [...new Set(schools)] })
       } else if (path === '/api/register') {
-        const fields = formFields(await readBody(request), EDITABLE_FIELDS)
+        const fields = formFields(await readBody(request), REGISTRATION_FIELDS)
         const data = await call('Register', 'POST', fields)
         if (typeof data?.email !== 'string')
           throw new ApiError(

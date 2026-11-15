@@ -13,6 +13,7 @@ export function marketplaceRoute(url) {
     '/api/conditions': ['Condition', 'names'],
   }
   const detail = /^\/api\/listings\/([1-9][0-9]*)$/.exec(url.pathname)
+  if (detail && !Number.isSafeInteger(Number(detail[1]))) fail(400, 'Invalid listing ID.')
   const match = routes[url.pathname] ?? (detail ? [`Listing/${detail[1]}`, 'detail'] : null)
   if (!match) return null
   return {
@@ -34,7 +35,7 @@ export function marketplaceRoute(url) {
 const common = ['title', 'price', 'category', 'condition', 'location', 'isbn', 'datetime', 'status', 'user']
 function imagePath(value) {
   if (value === null) return null
-  if (typeof value !== 'string' || !/^\/uploads\/[A-Za-z0-9_-]+\.[A-Za-z0-9]+$/.test(value))
+  if (typeof value !== 'string' || !/^\/uploads\/[A-Za-z0-9_-]+\.(?:png|jpg|jpeg|webp)$/.test(value))
     fail(502, 'The marketplace returned an unexpected image path.')
   return value
 }
@@ -50,6 +51,10 @@ function listing(value, detail) {
       : typeof v === 'string'
     if (!valid) fail(502, 'The marketplace returned an unexpected listing.')
     result[key] = v
+  }
+  if (value.days !== undefined) {
+    if (typeof value.days !== 'number' || !Number.isFinite(value.days)) fail(502, 'Invalid listing expiry.')
+    result.days = value.days
   }
   if (detail) {
     if (value.images_url !== null && !Array.isArray(value.images_url)) fail(502, 'Invalid marketplace images.')

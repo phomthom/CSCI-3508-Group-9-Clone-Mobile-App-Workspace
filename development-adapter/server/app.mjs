@@ -1,3 +1,4 @@
+import { createLimits } from './limits.mjs'
 import http from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { resolve, extname, sep } from 'node:path'
@@ -18,28 +19,31 @@ const TYPES = {
 export function createWebsiteServer({
   backend,
   appAccess,
-  user,
-  userPass,
-  renderProxy = false,
   production = true,
+  publicOrigin,
+  trafficPolicy,
+  apiOnly = false,
+  limits,
   timeoutMs,
   dist = DIST,
 } = {}) {
   const api = createApiHandler({
     backend,
     appAccess,
-    user,
-    userPass,
-    renderProxy,
     production,
+    publicOrigin,
+    trafficPolicy,
+    apiOnly,
     timeoutMs,
   })
   const root = resolve(dist)
+  const admit = limits ? createLimits(limits) : null
   return http.createServer(
     // These limit incoming uploads/headers, not the time spent waiting for the backend.
-    { requestTimeout: 30000, headersTimeout: 10000 },
+    { requestTimeout: 30000, headersTimeout: 10000, maxHeaderSize:16384, connectionsCheckingInterval:1000 },
     async (request, response) => {
       // Headers apply to both API and static responses, including error pages.
+      if (production && publicOrigin) response.setHeader('Strict-Transport-Security', 'max-age=31536000')
       response.setHeader('X-Content-Type-Options', 'nosniff')
       response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
       response.setHeader(
@@ -57,10 +61,20 @@ export function createWebsiteServer({
         return
       }
       if (pathname === '/api' || pathname.startsWith('/api/')) {
-        await api(request, response)
+        if (publicOrigin && request.headers.host !== new URL(publicOrigin).host) {
+          response.writeHead(421, {'Content-Type':'application/json','Cache-Control':'no-store'})
+          response.end(JSON.stringify({message:'Use the configured adapter origin.'})); return
+        }
+        if (admit && !admit(request,response,pathname)) return
+        try { await api(request, response) }
+        catch {
+          if (!response.headersSent) response.writeHead(500, {'Content-Type':'application/json','Cache-Control':'no-store'})
+          response.end(JSON.stringify({message:'Unable to complete this request.'}))
+        }
         return
       }
       if (pathname === '/healthz') {
+        if (!['GET','HEAD'].includes(request.method)) { response.writeHead(405, {Allow:'GET, HEAD'}); response.end(); return }
         // Render uses this lightweight process health check; it does not claim upstream readiness.
         response.writeHead(200, {
           'Content-Type': 'application/json',
@@ -69,11 +83,13 @@ export function createWebsiteServer({
         response.end(
           JSON.stringify({
             status: 'ok',
-            accountsConfigured: Boolean(backend && appAccess && user && userPass),
+            accountsConfigured: Boolean(backend && appAccess),
+            ...(trafficPolicy ? {backendTrafficEnabled:trafficPolicy.enabled === true} : {}),
           }),
         )
         return
       }
+      if (apiOnly) { response.writeHead(404); response.end('Not found'); return }
       if (!['GET', 'HEAD'].includes(request.method)) {
         response.writeHead(405, { Allow: 'GET, HEAD' })
         response.end()
